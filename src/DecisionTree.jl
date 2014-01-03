@@ -1,5 +1,9 @@
 module DecisionTree
 
+using DataFrames
+using DataStructures
+using NumericExtensions
+
 import Base: length, convert, promote_rule, show, start, next, done
 
 export Leaf, Node, print_tree,
@@ -12,17 +16,17 @@ include("measures.jl")
 
 immutable Leaf
     majority::Any
+    probs::Dict
     values::Vector
 end
 
 immutable Node
-    featid::Integer
-    featval::Any
-    left::Union(Leaf,Node)
-    right::Union(Leaf,Node)
+    featid::Any
+    featvals::Array
+    children::Array{Union(Leaf,Node)}
 end
 
-convert(::Type{Node}, x::Leaf) = Node(0, nothing, x, Leaf(nothing,[nothing]))
+convert(::Type{Node}, x::Leaf) = Node(0, Array[], [x])
 promote_rule(::Type{Node}, ::Type{Leaf}) = Node
 promote_rule(::Type{Leaf}, ::Type{Node}) = Node
 
@@ -39,10 +43,10 @@ end
 
 function print_tree(tree::Node, indent=0)
     println("Feature $(tree.featid), Threshold $(tree.featval)")
-    print("    " ^ indent * "L-> ")
-    print_tree(tree.left, indent + 1)
-    print("    " ^ indent * "R-> ")
-    print_tree(tree.right, indent + 1)
+    for (i,subtree) in enumerate(tree.children)
+        print("    " ^ indent * "$i-> ")
+        print_tree(subtree, indent + 1)
+    end
 end
 
 const NO_BEST=(0,0)
@@ -59,14 +63,90 @@ end
 # in a sorted vector
 # Note: the vector is assumed to be sorted, and no checking is done!
 immutable UniqueRanges
-    v::AbstractVector
+    v::Vector
+    start::Int
+    stop::Int
 end
 
-start(u::UniqueRanges) = 1
-done(u::UniqueRanges, s) = done(u.v, s)
+start(u::UniqueRanges) = u.start
+done(u::UniqueRanges, s) = s > u.stop
 next(u::UniqueRanges, s) = (val = u.v[s]; 
-                            t = searchsortedlast(u.v, val, s, length(u.v), Base.Order.Forward);
+                            t = min(searchsortedlast(u.v, val, s, length(u.v), Base.Order.Forward), u.stop);
                             ((val, s:t), t+1))
+
+UniqueRanges(v::Vector) = UniqueRanges(v, 1, length(v))
+
+function fix_splits!(feature::Vector, splits::Vector)
+    while length(splits) > 0 && searchsortedfirst(feature, splits[1]) == 1
+        shift!(splits)
+    end
+    return unique(splits)
+end
+
+function _split_on{T}(labels::Vector, feature::Vector{T}, num_parts::Int=2)
+    ord = sortperm(feature)
+    feature = feature[ord]
+    labels = labels[ord]
+    
+    uniq = unique(feature)
+
+    N = length(uniq)
+    part_size = N/num_parts
+    initial_splits = uniq[iround([part_size+1:part_size:N])]
+    fix_splits!(feature, initial_splits)
+
+    splits = _split_sorted(labels, feature, initial_splits)
+
+    return splits
+end
+
+function _split_sorted(labels::Vector, feature::Vector, splits::Vector, start::Int=1, stop::Int=length(labels))
+    if length(splits) > 1
+        splits_prev = copy(splits)
+        iters = 1
+        while true
+            splice!(splits, 1:length(splits)-1, _split_sorted(labels, feature, splits[1:end-1], 1, searchsortedfirst(feature, splits[end])-1))
+            splice!(splits, 2:length(splits), _split_sorted(labels, feature, splits[2:end], searchsortedfirst(feature, splits[1]), stop))
+            fix_splits!(feature, splits)
+            if splits == splits_prev || iters >= 100
+                if iters >= 100
+                    println("Max iters reached!")
+                end
+                break
+            end
+            iters += 1
+            resize!(splits_prev, length(splits))
+            copy!(splits_prev, splits)
+        end
+    elseif length(splits) == 1
+        best = feature[1]
+        best_val = -Inf
+
+        hist1 = _hist(labels, 1:0)
+        hist2 = _hist(labels, start:stop)
+        N1 = 0
+        N2 = stop-start+1
+
+        for (d, range) in UniqueRanges(feature, start, stop)
+            value = _info_gain(N1, hist1, N2, hist2)
+            if value > best_val
+                best_val = value
+                best = d
+            end
+
+            deltaN = length(range)
+
+            _hist_shift!(hist2, hist1, labels, range)
+            N1 += deltaN
+            N2 -= deltaN
+        end
+
+        splits[1] = best
+    end
+
+    return splits
+end
+
 
 function _split_info_gain(labels::Vector, features::Matrix, nsubfeatures::Int)
     nf = size(features, 2)
@@ -144,6 +224,46 @@ function build_stump(labels::Vector, features::Matrix, weights=[0])
                 Leaf(majority_vote(labels[!split]), labels[!split]))
 end
 
+function getprobs(labels::Vector)
+    counts = counter(labels)
+    total = sum(values(counts.map))
+    return [key=>(value/total) for (key, value) in counts]
+end
+
+function build_tree(labels::Vector, data::DataFrame, feature_splits::Array{Tuple})
+    if isempty(feature_splits)
+        return Leaf(majority_vote(labels), getprobs(labels), labels)
+    end
+
+    (feature_name, parts) = feature_splits[1]
+    feature = vec(array(data[:,feature_name]))
+    if isa(parts, Array)
+        featvals = parts
+    else
+        featvals = _split_on(labels, feature, parts)
+    end
+    if isempty(featvals)
+        return Leaf(majority_vote(labels), getprobs(labels), labels)
+    end
+
+    idxs = split_idxs(labels, feature, featvals)
+    child_label_sets = [labels[idx] for idx in idxs]
+    child_data_sets = [data[idx, :] for idx in idxs]
+   
+    children = Union(Node, Leaf)[]
+
+    for (child_labels, child_data) in zip(child_label_sets, child_data_sets)
+        if length(child_labels) <= 50
+            # probs calculated at current level, rather than child's level
+            push!(children, Leaf(majority_vote(child_labels), getprobs(labels), child_labels))
+        else
+            push!(children, build_tree(child_labels, child_data, feature_splits[2:end]))
+        end
+    end
+
+    Node(feature_name, featvals, children)
+end
+
 function build_tree(labels::Vector, features::Matrix, nsubfeatures=0)
     S = _split(labels, features, nsubfeatures, [0])
     if S == NO_BEST
@@ -203,10 +323,10 @@ function prune_tree(tree::Union(Leaf,Node), purity_thresh=1.0)
     return pruned
 end
 
-apply_tree(leaf::Leaf, feature::Vector) = leaf.majority
-
-function apply_tree(tree::Node, features::Vector)
-    if tree.featval == nothing
+function apply_tree(tree::Union(Leaf,Node), features::Vector)
+    if typeof(tree) == Leaf
+        return tree.majority
+    elseif tree.featval == nothing
         return apply_tree(tree.left, features)
     elseif features[tree.featid] < tree.featval
         return apply_tree(tree.left, features)
@@ -215,11 +335,33 @@ function apply_tree(tree::Node, features::Vector)
     end
 end
 
+function apply_tree(tree::Leaf, features::SubDataFrame)
+    return tree.probs[1]
+end
+
+function apply_tree(tree::Node, features::SubDataFrame)
+    for (i,featval) in enumerate(tree.featvals)
+        if features[tree.featid] < featval
+            return apply_tree(tree.children[i], features)
+        end
+    end
+    apply_tree(tree.children[end], features)
+end
+
 function apply_tree(tree::Union(Leaf,Node), features::Matrix)
     N = size(features,1)
     predictions = Array(Any,N)
     for i in 1:N
         predictions[i] = apply_tree(tree, squeeze(features[i,:],1))
+    end
+    return predictions
+end
+
+function apply_tree(tree::Union(Leaf,Node), features::DataFrame)
+    N = size(features,1)
+    predictions = Array(Float64,N)
+    for (i,row) in enumerate(EachRow(features))
+        predictions[i] = apply_tree(tree, row)
     end
     return predictions
 end

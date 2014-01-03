@@ -58,12 +58,31 @@ end
 
 _set_entropy(labels::Vector) = _set_entropy(_hist(labels), length(labels))
 
-function _info_gain(labels0::Vector, labels1::Vector)
-    N0 = length(labels0)
-    N1 = length(labels1)
-    N = N0 + N1
-    H = - N0/N * _set_entropy(labels0) - N1/N * _set_entropy(labels1)
+function _info_gain(labels::Vector...)
+    Ns = [length(label) for label in labels]
+    N = sum(Ns)
+    H = sum([- Ni/N * _set_entropy(labels_i) for (Ni,labels_i) in zip(Ns, labels)])
     return H
+end
+
+function split_idxs(labels::Vector, factor::Vector, splits::Vector)
+    split_idx = Array(Array{eltype(labels)}, length(splits)+1)
+    split_idx[1] = find([factor .< splits[1]])
+    for i = 2:length(splits)
+        split_idx[i] = find([splits[i-1] .<= factor .< splits[i]])
+    end
+    split_idx[end] = find([factor .>= splits[end]])
+    return split_idx
+end
+
+function split_labels(labels::Vector, factor::Vector, splits::Vector)
+    idxs = split_idxs(labels, factor, splits)
+    new_labels = [labels[idx] for idx in idxs]
+end
+
+function _info_gain2(labels::Vector, factor::Vector, splits::Vector)
+    new_labels = split_labels(labels, factor, splits)
+    _info_gain(new_labels...)
 end
 
 function _info_gain{T}(N1::Int, counts1::Dict{T,Int}, N2::Int, counts2::Dict{T,Int})
@@ -85,6 +104,9 @@ function _weighted_error{T<:Real}(actual::Vector, predicted::Vector, weights::Ve
 end
 
 function majority_vote(labels::Vector)
+    if length(labels) == 0
+        return 0
+    end
     counts = _hist(labels)
     top_vote = labels[1]
     top_count = -1
@@ -125,6 +147,8 @@ function _nfoldCV(classifier::Symbol, labels, features, args...)
     end
     if classifier == :tree
         pruning_purity = args[1]
+    elseif classifier == :df
+        feature_splits = args[1]
     elseif classifier == :forest
         nsubfeatures = args[1]
         ntrees = args[2]
@@ -132,7 +156,7 @@ function _nfoldCV(classifier::Symbol, labels, features, args...)
     elseif classifier == :stumps
         niterations = args[1]
     end
-    N = length(labels)
+    N = isa(labels, DataFrame) ? size(labels,1) : length(labels)
     ntest = ifloor(N / nfolds)
     inds = randperm(N)
     accuracy = zeros(nfolds)
@@ -150,6 +174,9 @@ function _nfoldCV(classifier::Symbol, labels, features, args...)
                 model = prune_tree(model, pruning_purity)
             end
             predictions = apply_tree(model, test_features)
+        elseif classifier == :df
+            model = build_tree(train_labels, train_features, feature_splits)
+            predictions = apply_tree(model, test_features)
         elseif classifier == :forest
             model = build_forest(train_labels, train_features, nsubfeatures, ntrees, partialsampling)
             predictions = apply_forest(model, test_features)
@@ -157,12 +184,21 @@ function _nfoldCV(classifier::Symbol, labels, features, args...)
             model, coeffs = build_adaboost_stumps(train_labels, train_features, niterations)
             predictions = apply_adaboost_stumps(model, coeffs, test_features)
         end
-        cm = confusion_matrix(test_labels, predictions)
-        accuracy[i] = cm.accuracy
         println("\nFold ", i)
-        println(cm)
+        if classifier != :df
+            cm = confusion_matrix(test_labels, predictions)
+            accuracy[i] = cm.accuracy
+            println(cm)
+        else
+            accuracy[i] = sumsq(predictions-test_labels)/ntest
+            println("  Mean Squared Error: $(accuracy[i])")
+        end
     end
-    println("\nMean Accuracy: ", mean(accuracy))
+    if classifier != :df
+        println("\nAccuracy: ", mean(accuracy))
+    else
+        println("\nAverage Mean Squared Error: ", mean(accuracy))
+    end
     return accuracy
 end
 
@@ -170,3 +206,4 @@ nfoldCV_tree(labels::Vector, features::Matrix, pruning_purity::Real, nfolds::Int
 nfoldCV_forest(labels::Vector, features::Matrix, nsubfeatures::Integer, ntrees::Integer, nfolds::Integer, partialsampling=0.7)  = _nfoldCV(:forest, labels, features, nsubfeatures, ntrees, partialsampling, nfolds)
 nfoldCV_stumps(labels::Vector, features::Matrix, niterations::Integer, nfolds::Integer)                                         = _nfoldCV(:stumps, labels, features, niterations, nfolds)
 
+nfoldCV_tree(labels::Vector, features::DataFrame, feature_splits::Vector, nfolds::Integer)                                           = _nfoldCV(:df, labels, features, feature_splits, nfolds)
